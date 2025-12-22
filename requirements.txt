@@ -1,0 +1,9 @@
+opencv-python
+numpy
+ultralytics
+paddleocr
+pyzbar
+# Optional for Android/Optimized
+# tensorflow
+# tflite-runtime
+# zxing-cpp

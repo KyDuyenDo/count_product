@@ -1,0 +1,19 @@
+# Virtual Environment
+po_barcode_env/
+venv/
+env/
+__pycache__/
+*.pyc
+
+# Large Model Files
+*.pt
+*.tflite
+*.onnx
+
+# IDEs
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
