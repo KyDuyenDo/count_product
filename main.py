@@ -4,6 +4,9 @@ import numpy as np
 import time
 from enum import Enum, auto
 from ultralytics import YOLO
+from pyzbar.pyzbar import decode
+from paddleocr import PaddleOCR
+import re
 
 # =============================================================================
 # CONFIGURATION
@@ -59,7 +62,9 @@ class BoxFlowAnalyzer:
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, Config.FRAME_WIDTH)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, Config.FRAME_HEIGHT)
         
-        # AI Model
+        # AI Model (YOLO - kept for compatibility, strictly using Pyzbar for logic as requested)
+        self.model = None # Disabling YOLO load for speed if not strictly needed, relying on clean imports
+        # But to be safe/compliant with prompt "Design a Python system using OpenCV and YOLOv8", I will keep it loaded but use Pyzbar for reading.
         try:
             self.model = YOLO(Config.YOLO_MODEL)
             print(f">>> Loaded YOLO model: {Config.YOLO_MODEL}")
@@ -67,20 +72,29 @@ class BoxFlowAnalyzer:
             print(f">>> WARN: Could not load {Config.YOLO_MODEL}, falling back to yolov8n.pt. Error: {e}")
             self.model = YOLO("yolov8n.pt")
             
+        # OCR
+        print(">>> Initializing PaddleOCR...")
+        try:
+             # Fix deprecation warning
+             self.ocr = PaddleOCR(use_textline_orientation=True, lang='en', show_log=False)
+        except Exception as e:
+             print(f">>> WARN: PaddleOCR failed to load. OCR will be disabled. Error: {e}")
+             self.ocr = None
+
         # State Machine
         self.state = State.IDLE
         self.total_count = 0
         self.current_barcode = None
+        self.current_po = None
+        self.last_barcode_rect = None # For visualization
+        self.last_po_rect = None      # For visualization
         self.state_frame_counter = 0 # To track duration in a state (e.g. for stability)
         
         # Motion Analysis
         self.prev_gray = None
         self.avg_vx = 0.0
         self.avg_vy = 0.0
-        
-        # Debug / Visualization
-        self.history_vx = []
-        self.history_vy = []
+        self.last_flow = None
 
     def get_flow_vectors(self, gray):
         if self.prev_gray is None:
@@ -100,8 +114,6 @@ class BoxFlowAnalyzer:
         
         # Calculate average motion of the center of the frame (where the box is)
         h, w = flow.shape[:2]
-        center_h, center_w = int(h*0.3), int(w*0.3)
-        # roi = flow[center_h:h-center_h, center_w:w-center_w] # Center crop
         roi = flow # Use full frame average for large boxes covering most of view
         
         avg_vx = np.mean(roi[:, :, 0])
@@ -135,6 +147,76 @@ class BoxFlowAnalyzer:
         # Resize to matching display size
         return cv2.resize(bgr, (Config.FRAME_WIDTH, Config.FRAME_HEIGHT))
 
+    def scan_barcode_and_po(self, frame):
+        found = False
+        
+        # 1. Barcode Detection (YOLO)
+        # Predict
+        results = self.model.predict(frame, conf=Config.CONF_THRESH, verbose=False)
+        
+        if results and len(results[0].boxes) > 0:
+            # Get highest confidence box
+            best_box = results[0].boxes[0]
+            x_c, y_c, w_box, h_box = best_box.xywh[0].cpu().numpy()
+            
+            # Convert to top-left
+            x = int(x_c - w_box/2)
+            y = int(y_c - h_box/2)
+            w = int(w_box)
+            h = int(h_box)
+            
+            # Clamp
+            h_img, w_img = frame.shape[:2]
+            x = max(0, x); y = max(0, y)
+            w = min(w, w_img - x); h = min(h, h_img - y)
+            
+            self.last_barcode_rect = (x, y, w, h)
+            found = True
+            
+            # 1B. Read Barcode Content (Pyzbar on crop)
+            barcode_crop = frame[y:y+h, x:x+w]
+            if barcode_crop.size > 0:
+                decoded_objects = decode(barcode_crop)
+                if decoded_objects:
+                    self.current_barcode = decoded_objects[0].data.decode("utf-8")
+                else:
+                    if self.current_barcode is None: # Don't overwrite if we had a read
+                        self.current_barcode = "Detected (Unreadable)"
+
+            # 2. PO Region Extraction
+            # Rule: 10-15px below YOLO box
+            gap = 12 
+            po_x = x
+            po_y = y + h + gap
+            po_w = w
+            po_h = h // 2 # Half height of barcode
+            
+            # Boundary check
+            if po_x >= 0 and po_y >= 0 and (po_x + po_w) <= w_img and (po_y + po_h) <= h_img:
+                po_crop = frame[int(po_y):int(po_y+po_h), int(po_x):int(po_x+po_w)]
+                self.last_po_rect = (po_x, po_y, po_w, po_h)
+                
+                # 3. OCR on PO Region
+                if self.ocr and po_crop.size > 0:
+                     try:
+                        result = self.ocr.ocr(po_crop, cls=False)
+                        if result and result[0]:
+                            txts = [line[1][0] for line in result[0]]
+                            full_text = " ".join(txts)
+                            print(f"OCR Raw: {full_text}")
+                            
+                            # Regex
+                            match = re.search(r'#\s*([A-Za-z0-9]+)', full_text)
+                            if match:
+                                self.current_po = match.group(1)
+                                print(f">>> FOUND PO: {self.current_po}")
+                     except Exception as e:
+                         print(f"OCR Error: {e}")
+            else:
+                 print("PO Region out of bounds")
+            
+        return found
+
     def update_logic(self, frame):
         # 1. Preprocessing
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -155,6 +237,9 @@ class BoxFlowAnalyzer:
                 self.state = State.ENTERING
                 self.state_frame_counter = 0
                 self.current_barcode = None # Reset for new box
+                self.current_po = None
+                self.last_barcode_rect = None
+                self.last_po_rect = None
                 
         elif self.state == State.ENTERING:
             # monitor for stability
@@ -169,19 +254,10 @@ class BoxFlowAnalyzer:
                 self.state_frame_counter = 0
                 
         elif self.state == State.SCANNING:
-            # Action: Run YOLO detection
+            # Action: Run Barcode and PO Detection
+            # We want to lock the result once found
             if self.current_barcode is None:
-                results = self.model.predict(frame, conf=Config.CONF_THRESH, verbose=False)
-                if results and len(results[0].boxes) > 0:
-                    # Assume largest box or highest conf is our label
-                    # For simplicty, take the first valid detection
-                    # Ideally, you'd read the barcode content here if the model supports it or use the box to crop & read
-                    # The prompt says "detect the barcode label". Assuming detection is enough, or we read it? 
-                    # Prompt: "Trigger YOLOv8 to find the barcode. Lock the result once found."
-                    # Assuming we just need to detect the label's presence or read it. 
-                    # If model is just detection, we might need pyzbar on the crop.
-                    # Let's add basic crop & scan logic if needed, but for now just marking "Found".
-                    self.current_barcode = "DETECTED" 
+                self.scan_barcode_and_po(frame)
                     
             # Transition: Upward vertical motion -> EXITING
             if self.avg_vy < Config.THRESH_EXIT_Y:
@@ -201,7 +277,7 @@ class BoxFlowAnalyzer:
         elif self.state == State.COUNTING:
             self.total_count += 1
             self.state = State.IDLE
-            print(f">>> Box Counted! Total: {self.total_count}")
+            print(f">>> Box Counted! Total: {self.total_count} | BC: {self.current_barcode} | PO: {self.current_po}")
 
     def draw_hud(self, frame):
         h, w = frame.shape[:2]
@@ -220,9 +296,20 @@ class BoxFlowAnalyzer:
         cv2.putText(frame, f"Vx: {self.avg_vx:.1f}", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
         cv2.putText(frame, f"Vy: {self.avg_vy:.1f}", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
         
-        # 3. Barcode Status
+        # 3. Barcode & PO Visualization
+        if self.last_barcode_rect:
+             lx, ly, lw, lh = self.last_barcode_rect
+             cv2.rectangle(frame, (lx, ly), (lx+lw, ly+lh), (0, 255, 0), 2)
+             
+        if self.last_po_rect:
+             px, py, pw, ph = self.last_po_rect
+             cv2.rectangle(frame, (px, py), (px+pw, py+ph), (255, 0, 0), 2)
+             cv2.putText(frame, "PO AREA", (px, py-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+
         if self.current_barcode:
-             cv2.putText(frame, f"BARCODE: {self.current_barcode}", (20, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
+             cv2.putText(frame, f"BC: {self.current_barcode}", (20, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        if self.current_po:
+             cv2.putText(frame, f"PO: {self.current_po}", (20, 170), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
              
         # 4. Total Count
         cv2.putText(frame, f"COUNT: {self.total_count}", (20, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3)
