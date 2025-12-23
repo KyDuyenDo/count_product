@@ -31,7 +31,7 @@ class Config:
     FLOW_POLY_SIGMA = 1.2
     
     # Motion Thresholds (Pixels per frame, adjusted for downscale)
-    THRESH_ENTRY_X = 2.0      # Significant horizontal motion
+    THRESH_ENTRY_X = 0.5      # Significant horizontal motion (Lowered for sensitivity)
     THRESH_EXIT_Y = -3.0      # Significant UPWARD vertical motion (negative Y)
     THRESH_STABLE = 1.0       # Low motion threshold
     
@@ -41,9 +41,14 @@ class Config:
     DEBOUNCE_FRAMES = 3       # Frames of consistent motion to trigger ENTERING
     
     # Logic
-    STABILITY_FRAMES = 5      # Frames of low motion to trigger SCANNING
+    STABILITY_FRAMES = 3      # Frames of low motion to trigger SCANNING (Faster entry)
     RESET_FRAMES = 10         # Frames of low motion to trigger COUNTING (after exit)
     BARCODE_PERSISTENCE = 10  # Frames to keep barcode after detection loss
+    OCR_THROTTLE_FRAMES = 1   # Run OCR every frame in SCANNING state (Max reliability)
+    
+    # Work Zone (Percent of Frame Width)
+    WORK_ZONE_X_MIN = 0.25    # Left boundary (25%)
+    WORK_ZONE_X_MAX = 0.75    # Right boundary (75%)
     
     # YOLO
     YOLO_MODEL = "YOLOV8s_Barcode_Detection.pt" # Or "yolov8n.pt" if custom not found
@@ -143,6 +148,41 @@ class BoxFlowAnalyzer:
         self.last_flow = flow 
         return avg_vx, avg_vy
 
+    def get_object_centroid(self, frame):
+        """
+        Finds the center (x, y) of the largest object in the frame.
+        Assumes dark object on light background or vice-versa.
+        Returns (cx, cy) or None.
+        """
+        # Convert to grayscale and blur
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (21, 21), 0)
+        
+        # Simple thresholding (Adjust 100 based on lighting)
+        _, thresh = cv2.threshold(blurred, 100, 255, cv2.THRESH_BINARY_INV)
+        
+        # Find contours
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if not contours:
+            return None
+            
+        # Get largest contour
+        c = max(contours, key=cv2.contourArea)
+        
+        # Ignore small noise
+        if cv2.contourArea(c) < 3000:
+            return None
+            
+        # Compute Center
+        M = cv2.moments(c)
+        if M["m00"] != 0:
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
+            return cx, cy
+        
+        return None
+
     def visualize_flow(self):
         # Adjusted visualization to show ROI flow
         if not hasattr(self, 'last_flow') or self.last_flow is None:
@@ -198,13 +238,18 @@ class BoxFlowAnalyzer:
         # sigmaSpace=75: Filter sigma in coordinate space
         filtered = cv2.bilateralFilter(gray, 9, 75, 75)
         
-        # 4. Adaptive Thresholding
+    # 4. Adaptive Thresholding
         # ADAPTIVE_THRESH_GAUSSIAN_C: Threshold value is weighted sum of neighbourhood values
         # THRESH_BINARY: Maxval is 255
         # Block Size: 11
         # C: 2 (Constant subtracted from mean)
         binary = cv2.adaptiveThreshold(filtered, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
                                      cv2.THRESH_BINARY, 11, 2)
+                                     
+        # 5. Morphological Closing (Connect broken characters)
+        # Useful for dot-matrix or noisy prints
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
                                      
         # Convert to BGR for display
         return cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
@@ -290,11 +335,18 @@ class BoxFlowAnalyzer:
                                     full_text = full_text.strip()
                                     print(f"OCR Raw: {full_text}")
                                     
-                                    # Regex: # followed by alphanumeric
-                                    match = re.search(r'#\s*([A-Za-z0-9]+)', full_text)
-                                    if match:
-                                        self.current_po = match.group(1)
-                                        print(f">>> FOUND PO: {self.current_po}")
+                                    # Regex: Relaxed - find any sequence of 5 or more digits
+                                    # User specified no strict length limit and no required prefix
+                                    candidates = re.findall(r'\d{5,}', full_text)
+                                    
+                                    if candidates:
+                                        # Heuristic: The longest number sequence is likely the PO
+                                        # (Avoids picking up small stray numbers)
+                                        best_cand = max(candidates, key=len)
+                                        
+                                        self.current_po = best_cand
+                                        print(f">>> FOUND PO (Relaxed): {self.current_po}")
+                                            
                                 except Exception as e:
                                     # print(f"OCR Error: {e}")
                                     pass # Silence errors
@@ -327,7 +379,7 @@ class BoxFlowAnalyzer:
         # Magnitude
         mag = np.sqrt(self.avg_vx**2 + self.avg_vy**2)
         
-        # 3. FSM Transitions
+        # 3. FSM Transitions (Refactor v6 - Work Zone)
         
         if self.state == State.IDLE:
             # Transition: Significant horizontal motion with DEBOUNCING
@@ -340,33 +392,70 @@ class BoxFlowAnalyzer:
                 self.state = State.ENTERING
                 self.state_frame_counter = 0
                 self.debounce_counter = 0
-                self.current_barcode = None # Reset for new box
+                # Reset tracking data
+                self.current_barcode = None 
                 self.current_po = None
                 self.last_barcode_rect = None
                 self.last_po_rect = None
                 self.barcode_missing_frames = 0
                 
         elif self.state == State.ENTERING:
-            # monitor for stability
+            # Requirement: Box must stabilize IN THE WORK ZONE to start scanning
             if mag < Config.THRESH_STABLE:
                 self.state_frame_counter += 1
             else:
                 self.state_frame_counter = 0
                 
-            # Transition: Stable for N frames -> SCANNING
+            # Check stability duration
             if self.state_frame_counter >= Config.STABILITY_FRAMES:
-                self.state = State.SCANNING
-                self.state_frame_counter = 0
+                # Check WORK ZONE Position
+                centroid = self.get_object_centroid(frame)
+                if centroid:
+                    cx, cy = centroid
+                    frame_w = Config.FRAME_WIDTH
+                    
+                    # Verify X center is in [25% - 75%] zone
+                    valid_zone = (frame_w * Config.WORK_ZONE_X_MIN) < cx < (frame_w * Config.WORK_ZONE_X_MAX)
+                    
+                    if valid_zone:
+                         self.state = State.SCANNING
+                         self.state_frame_counter = 0
+                    else:
+                         # Still stable, but not centered. Wait.
+                         pass
+                else:
+                    # No object found? Maybe unstable lighting. Wait.
+                    pass
                 
         elif self.state == State.SCANNING:
-            # Action: Run Barcode and PO Detection
-            # Continuous scanning to handle updates/intermittent loss
-            self.scan_barcode_and_po(frame)
+            # Action: Run Barcode and PO Detection (Throttled)
+            self.frame_count_total += 1
+            if self.frame_count_total % Config.OCR_THROTTLE_FRAMES == 0:
+                 self.scan_barcode_and_po(frame)
                     
-            # Transition: Upward vertical motion -> EXITING
-            if self.avg_vy < Config.THRESH_EXIT_Y:
-                self.state = State.EXITING
-                self.state_frame_counter = 0
+            # GRACE PERIOD & PO EXTENSION: 
+            # Force stay in scanning for at least 30 frames (approx 1 sec)
+            # OR if we have a barcode but NO PO yet (give it more time)
+            
+            extend_scan = False
+            if self.current_barcode and not self.current_po:
+                # If we have barcode but no PO, give it extra time (up to 60 frames)
+                if self.state_frame_counter < 60:
+                    extend_scan = True
+            
+            self.state_frame_counter += 1
+            
+            if self.state_frame_counter < 10 or extend_scan:
+                pass # Force stay
+            else:
+                # Transition: Uppward vertical motion -> EXITING
+                # Horizontal motion is NOW IGNORED (Refactor v10) - stay scanning!
+                is_moving_vert = self.avg_vy < Config.THRESH_EXIT_Y
+                # is_moving_horz = abs(self.avg_vx) > Config.THRESH_ENTRY_X
+                
+                if is_moving_vert:
+                    self.state = State.EXITING
+                    self.state_frame_counter = 0
                 
         elif self.state == State.EXITING:
             # Animation: Move the visualization boxes with the flow
@@ -383,7 +472,6 @@ class BoxFlowAnalyzer:
                 self.last_po_rect = (px, py, pw, ph)
 
             # Transition: Motion stops (scene cleared) -> COUNTING
-            # OR if the box has moved completely off screen (optional check, but time-based is fine)
             if mag < Config.THRESH_STABLE:
                 self.state_frame_counter += 1
             else:
@@ -394,18 +482,33 @@ class BoxFlowAnalyzer:
         
         elif self.state == State.COUNTING:
             # Condition: Only count if we actually found a barcode
-            # This prevents counting "camera shakes" or empty motion events
             if self.current_barcode:
                 self.total_count += 1
                 print(f">>> Box Counted! Total: {self.total_count} | BC: {self.current_barcode} | PO: {self.current_po}")
+                
             else:
                  print(">>> Movement finished but no barcode found. Ignoring count (Shake/False Trigger).")
-                 
+            
+            # CRITICAL: Clear all data to prevent ghosting
+            self.current_barcode = None
+            self.current_po = None
+            self.last_barcode_rect = None
+            self.last_po_rect = None
+            
             self.state = State.IDLE
 
     def draw_hud(self, frame):
         h, w = frame.shape[:2]
         
+        # 0. Draw Work Zone (Vertical Lines)
+        min_x = int(w * Config.WORK_ZONE_X_MIN)
+        max_x = int(w * Config.WORK_ZONE_X_MAX)
+        
+        cv2.line(frame, (min_x, 0), (min_x, h), (255, 255, 0), 2) # Cyan Line Left
+        cv2.line(frame, (max_x, 0), (max_x, h), (255, 255, 0), 2) # Cyan Line Right
+        
+        cv2.putText(frame, "WORK ZONE", (min_x + 10, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
+
         # 1. State Visualization (Top Left)
         cv2.putText(frame, f"STATE: {self.state.name}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         
