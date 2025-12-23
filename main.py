@@ -213,11 +213,10 @@ class BoxFlowAnalyzer:
 
     def preprocess_for_ocr(self, img):
         """
-        Advanced Preprocessing (Refactor v4):
-        1. 2x Upscale
-        2. Grayscale
-        3. Bilateral Filter (Noise Removal, Edge Preservation)
-        4. Adaptive Thresholding (Handle varying lighting)
+        Refactor v11: Color + Brightness
+        1. 2x Upscale (Required for Tesseract on small text)
+        2. Brightness/Contrast Boost (alpha=1.1, beta=50)
+        3. No Grayscale/Thresholding (keep original color info)
         """
         if img is None or img.size == 0:
             return None
@@ -226,33 +225,12 @@ class BoxFlowAnalyzer:
         scale = 2.0
         upscaled = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
         
-        # 2. Grayscale
-        if len(upscaled.shape) == 3:
-            gray = cv2.cvtColor(upscaled, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = upscaled
-            
-        # 3. Bilateral Filter
-        # d=9: Diameter of pixel neighborhood
-        # sigmaColor=75: Filter sigma in color space
-        # sigmaSpace=75: Filter sigma in coordinate space
-        filtered = cv2.bilateralFilter(gray, 9, 75, 75)
+        # 2. Adjust Brightness & Contrast
+        # Alpha > 1.0 (Contrast), Beta > 0 (Brightness)
+        # User requested: Keep color, increase brightness
+        adjusted = cv2.convertScaleAbs(upscaled, alpha=1.1, beta=50)
         
-    # 4. Adaptive Thresholding
-        # ADAPTIVE_THRESH_GAUSSIAN_C: Threshold value is weighted sum of neighbourhood values
-        # THRESH_BINARY: Maxval is 255
-        # Block Size: 11
-        # C: 2 (Constant subtracted from mean)
-        binary = cv2.adaptiveThreshold(filtered, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                     cv2.THRESH_BINARY, 11, 2)
-                                     
-        # 5. Morphological Closing (Connect broken characters)
-        # Useful for dot-matrix or noisy prints
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-                                     
-        # Convert to BGR for display
-        return cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+        return adjusted
 
     def scan_barcode_and_po(self, frame):
         found = False
@@ -321,7 +299,7 @@ class BoxFlowAnalyzer:
                             # Visual Confirmation: Label the image
                             cv2.putText(po_processed, "OCR INPUT", (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
                             
-                            cv2.imshow("Debug PO Input", po_processed)
+                            # cv2.imshow("Debug PO Input", po_processed)
                             
                             # Smart Throttling: Scan faster if SCANNING (Stable)
                             interval = 5 if self.state == State.SCANNING else 15
@@ -428,6 +406,17 @@ class BoxFlowAnalyzer:
                     pass
                 
         elif self.state == State.SCANNING:
+            # Emergency Exit: Check if object actually exists (Refactor v12)
+            # If user lifted the box, centroid will be None
+            if not self.get_object_centroid(frame):
+                 # Stop Ghosting UI immediately
+                 self.last_barcode_rect = None
+                 self.last_po_rect = None
+                 # Force Transition to COUNTING
+                 self.state = State.COUNTING
+                 self.state_frame_counter = 0
+                 return # Skip rest of scanning logic for this frame
+
             # Action: Run Barcode and PO Detection (Throttled)
             self.frame_count_total += 1
             if self.frame_count_total % Config.OCR_THROTTLE_FRAMES == 0:
@@ -586,7 +575,7 @@ class BoxFlowAnalyzer:
             
             # Visualize Flow
             flow_vis = self.visualize_flow()
-            cv2.imshow("Optical Flow", flow_vis)
+            # cv2.imshow("Optical Flow", flow_vis)
             
             cv2.imshow("BoxFlowAnalyzer", frame)
             
