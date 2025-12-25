@@ -1,4 +1,3 @@
-
 import cv2
 import numpy as np
 import time
@@ -6,12 +5,10 @@ import threading
 import queue
 from collections import deque
 from enum import Enum, auto
-from ultralytics import YOLO
 from pyzbar.pyzbar import decode
 import pytesseract
 import re
 
-# New Imports
 from config import Config
 from data_provider import DataProvider
 
@@ -34,15 +31,7 @@ class State(Enum):
 
 class BoxFlowAnalyzer:
     def __init__(self):
-        # Hardware
-        self.cap = cv2.VideoCapture(Config.CAMERA_ID)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, Config.FRAME_WIDTH)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, Config.FRAME_HEIGHT)
-        self.cap.set(cv2.CAP_PROP_AUTOFOCUS, Config.AUTOFOCUS_VAL)
-        self.cap.set(cv2.CAP_PROP_FOCUS, Config.FOCUS_VAL)
-        
         # Tools
-        self.model = None 
         self.data_provider = DataProvider()
         
         # OCR
@@ -171,7 +160,9 @@ class BoxFlowAnalyzer:
             x, y, w, h = avg_rect
             self.last_barcode_rect = (x, y, w, h)
             
-            # PO Region 
+            # PO Region
+            # Determine orientation or just use below
+            # Assuming vertical stacking
             gap = 12 
             po_x, po_y = x, y + h + gap
             po_w, po_h = w, h // 2
@@ -185,12 +176,16 @@ class BoxFlowAnalyzer:
                     if po_crop.size > 0:
                         po_processed = self.preprocess_for_ocr(po_crop)
                         if po_processed is not None and self.use_ocr:
-                            full_text = pytesseract.image_to_string(po_processed).strip()
-                            candidates = re.findall(r'\d{5,}', full_text)
-                            if candidates:
-                                best_cand = max(candidates, key=len)
-                                self.current_po = best_cand
-                                print(f">>> FOUND PO: {self.current_po}")
+                            try:
+                                full_text = pytesseract.image_to_string(po_processed).strip()
+                                candidates = re.findall(r'\d{5,}', full_text)
+                                if candidates:
+                                    best_cand = max(candidates, key=len)
+                                    self.current_po = best_cand
+                                    print(f">>> FOUND PO: {self.current_po}")
+                            except Exception as e:
+                                print(f"OCR Error: {e}")
+
         else:
              self.barcode_missing_frames += 1
              if self.barcode_missing_frames > Config.BARCODE_PERSISTENCE:
@@ -209,12 +204,12 @@ class BoxFlowAnalyzer:
         # Filter 1: Temporal Throttle
         now = time.time()
         if (now - self.last_api_time) < Config.API_COOLDOWN_SECONDS:
-            print("[Anti-Spam] Throttled (Too fast)")
+            # print("[Anti-Spam] Throttled (Too fast)")
             return
 
         # Filter 2: Unique Sequence (Repeated Failures)
         if self.current_po in self.failed_pos:
-            print(f"[Anti-Spam] Message Suppressed: PO {self.current_po} already failed recently.")
+            # print(f"[Anti-Spam] Message Suppressed: PO {self.current_po} already failed recently.")
             return
 
         # Start Thread
@@ -235,7 +230,13 @@ class BoxFlowAnalyzer:
         t.daemon = True
         t.start()
 
-    def update_logic(self, frame):
+    def process_frame(self, frame):
+        """
+        Main logic loop called by Kivy's update loop.
+        Returns the frame with HUD drawn.
+        """
+        if frame is None: return None
+
         # 1. Motion Analysis
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         vx, vy = self.get_flow_vectors(gray)
@@ -244,14 +245,20 @@ class BoxFlowAnalyzer:
         mag = np.sqrt(self.avg_vx**2 + self.avg_vy**2)
         
         # 2. Physical Reset Trigger (Anti-Spam Reset)
-        # If significant motion detected, user might have adjusted the box.
         if mag > 2.0: # Threshold for manual adjustment
             if self.failed_pos:
-                print("[Anti-Spam] Physical Movement Detected - Clearing Failure Cache")
+                # print("[Anti-Spam] Physical Movement Detected - Clearing Failure Cache")
                 self.failed_pos.clear()
 
-        # 3. State Machine
+        # 3. State Machine Logic
+        self._update_state_machine(frame, mag)
+
+        # 4. Draw HUD
+        self._draw_hud(frame)
         
+        return frame
+
+    def _update_state_machine(self, frame, mag):
         if self.state == State.IDLE:
             if abs(self.avg_vx) > Config.THRESH_ENTRY_X:
                 self.debounce_counter += 1
@@ -278,11 +285,10 @@ class BoxFlowAnalyzer:
                     if (w * Config.WORK_ZONE_X_MIN) < cx < (w * Config.WORK_ZONE_X_MAX):
                          self.state = State.SCANNING
                          self.state_frame_counter = 0
-                         self.scan_start_time = time.time() # Start Timer
+                         self.scan_start_time = time.time() 
 
         elif self.state == State.SCANNING:
             if not self.get_object_centroid(frame):
-                 # Emergency exit (lifted) - Clear ghosts
                  self.last_barcode_rect = None
                  self.rect_history.clear()
                  self.state = State.COUNTING 
@@ -292,19 +298,15 @@ class BoxFlowAnalyzer:
                  self.scan_barcode_and_po(frame)
             self.frame_count_total += 1
             
-            # Trigger Validation logic
             if self.current_barcode and self.current_po:
-                # If we have both, we attempt to validate
                  self.trigger_validation()
             
-            # Transition to EXITING?
             is_moving_vert = self.avg_vy < Config.THRESH_EXIT_Y
             if is_moving_vert:
                 self.state = State.EXITING
                 self.state_frame_counter = 0
 
         elif self.state == State.VALIDATING:
-            # Check for thread result non-blocking
             try:
                 result = self.validation_queue.get_nowait()
                 self.is_validating_thread = False
@@ -312,30 +314,22 @@ class BoxFlowAnalyzer:
                 if result and result.get("valid"):
                     self.validation_result = result
                     self.state = State.VALIDATED
-                    
-                    # COUNT IMMEDIATELY ON VALIDATION
                     self.total_count += 1
                     
-                    # Calculate Logic Time
                     if self.scan_start_time:
                         self.processing_time = time.time() - self.scan_start_time
                         print(f">>> Processed in {self.processing_time:.2f}s")
-                        
                     print(f">>> VALIDATION SUCCESS: {result}")
-                    print(f">>> COUNTED! Total: {self.total_count}")
                     
                 else:
-                    print(">>> VALIDATION FAILED")
-                    self.failed_pos.add(self.current_po) # Block this PO until motion
-                    self.state = State.SCANNING # Go back to scanning to retry or adjust
+                    self.failed_pos.add(self.current_po)
+                    self.state = State.SCANNING
                     self.current_po = None 
                     
             except queue.Empty:
-                pass # Wait...
+                pass 
 
         elif self.state == State.VALIDATED:
-            # Locked state - show green frame, success info.
-            # Wait for exit
             is_moving_vert = self.avg_vy < Config.THRESH_EXIT_Y
             if is_moving_vert:
                 self.state = State.EXITING
@@ -354,23 +348,17 @@ class BoxFlowAnalyzer:
                 self.state = State.COUNTING
         
         elif self.state == State.COUNTING:
-            # Just reset state, no counting here
             self.current_barcode = None
             self.current_po = None
             self.validation_result = None
             self.failed_pos.clear()
-            
-            # Clear Ghost Box
             self.last_barcode_rect = None
             self.rect_history.clear()
-            
-            # Clear Timers
             self.scan_start_time = None
             self.processing_time = None
-            
             self.state = State.IDLE
 
-    def draw_hud(self, frame):
+    def _draw_hud(self, frame):
         h, w = frame.shape[:2]
         
         # Zones
@@ -383,15 +371,12 @@ class BoxFlowAnalyzer:
         state_color = (0, 255, 0)
         if self.state == State.VALIDATING: state_color = (0, 255, 255) # Yellow
         if self.state == State.VALIDATED: state_color = (0, 200, 0)    # Green
-        cv2.putText(frame, f"STATE: {self.state.name}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, state_color, 2)
+        cv2.putText(frame, f"STATE: {self.state.name}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, state_color, 2)
         
         # Object Info
         if self.last_barcode_rect:
              lx, ly, lw, lh = self.last_barcode_rect
              
-             # Color Logic
-             # Green Frame: Data Validated
-             # Yellow/Orange Frame: PO Not Found / Invalid
              color = (0, 255, 255) # Default Yellow
              
              if self.state == State.VALIDATED:
@@ -410,14 +395,13 @@ class BoxFlowAnalyzer:
                  
              # Success Details
              if self.validation_result:
-                 info = f"{self.validation_result['article']} | Size: {self.validation_result['size']}"
+                 info = f"{self.validation_result.get('article', '?')} | Size: {self.validation_result.get('size', '?')}"
                  cv2.putText(frame, info, (lx, ly + lh + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                  
                  if self.processing_time:
                      time_str = f"Time: {self.processing_time:.2f}s"
                      cv2.putText(frame, time_str, (lx, ly + lh + 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
              
-             # Failure Details
              if self.state == State.SCANNING and self.current_po in self.failed_pos:
                  cv2.putText(frame, "Invalid Code", (lx, ly + lh + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
@@ -429,25 +413,3 @@ class BoxFlowAnalyzer:
 
         # Total Count
         cv2.putText(frame, f"COUNT: {self.total_count}", (20, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3)
-
-    def run(self):
-        print(">>> Starting Box Scanning System...")
-        while True:
-            ret, frame = self.cap.read()
-            if not ret:
-                time.sleep(1)
-                continue
-                
-            self.update_logic(frame)
-            self.draw_hud(frame)
-            cv2.imshow("Box Scanner", frame)
-            
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-        
-        self.cap.release()
-        cv2.destroyAllWindows()
-
-if __name__ == "__main__":
-    app = BoxFlowAnalyzer()
-    app.run()
