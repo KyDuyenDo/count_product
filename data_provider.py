@@ -1,4 +1,10 @@
-import pyodbc
+import time
+try:
+    import pyodbc
+    PYODBC_AVAILABLE = True
+except ImportError:
+    PYODBC_AVAILABLE = False
+    print("Warning: pyodbc not found. SQL features will be disabled.")
 import time
 from config import Config
 
@@ -23,17 +29,17 @@ class DataProvider:
     def _get_sql_connection(self):
         """Hàm helper để quản lý kết nối: Tự động reconnect nếu mất"""
         try:
-            if self.conn is None:
+            if self.conn is None and PYODBC_AVAILABLE:
                 print("[SQL] Opening new connection...")
                 self.conn = pyodbc.connect(self.conn_str)
             return self.conn
-        except pyodbc.Error as e:
+        except Exception as e:
             print(f"[SQL CONNECT ERROR] {e}")
             self.conn = None
             return None
 
     def validate_po_barcode(self, po: str, barcode: str):
-        if Config.USE_MOCK:
+        if Config.USE_MOCK or not PYODBC_AVAILABLE:
             return self._validate_mock(po, barcode)
         else:
             return self._validate_sql(po, barcode)
@@ -110,7 +116,7 @@ class DataProvider:
                 }
             return None
 
-        except pyodbc.Error as e:
+        except Exception as e:
             print(f"[SQL QUERY ERROR] {e}")
             self.conn = None 
             return None

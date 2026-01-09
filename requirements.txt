@@ -1,6 +1,5 @@
 opencv-python
 numpy
-ultralytics
-paddleocr
+pytesseract
 pyzbar
 pyodbc

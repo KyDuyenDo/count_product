@@ -42,7 +42,7 @@ class Config:
     CONF_THRESH = 0.4
 
     # Database & Validation
-    USE_MOCK = False         # Toggle: True=Local Dict, False=Real SQL Server
+    USE_MOCK = True         # Toggle: True=Local Dict, False=Real SQL Server
     DB_SERVER = "192.168.30.115"
     DB_NAME = "Adidas_Shoebox"
     DB_USER = "odin"
